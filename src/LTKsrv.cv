@@ -1,0 +1,419 @@
+#include"../include/LTKlib.h"
+
+/*	Close TCP server
+	This is automatically called for an LTKCON_COUNTED_OPEN container.
+	This toggles the container to LTKCON_SOCKET_CLOSED if called manually,
+	that means that the container won't open automatically if a client leaves.
+*/
+void LTKCntLock(LTKobj *obj, va_list arg) {
+	LTKcontainer *cnt = (LTKcontainer *) obj;
+
+	switch(cnt->_status) {
+	case LTKCON_REGULAR:
+	case LTKCON_SOCKET_CLOSED:
+	case LTKCON_COUNTED_CLOSED:
+		return;
+
+	default:
+		LTKTrg(0, cnt->_dev._fd, 0);
+		shutdown(cnt->_dev._fd, SHUT_RDWR); /* Avoid time wait */
+		close(cnt->_dev._fd);
+
+		cnt->_dev._fd = -1;
+		if(!cnt->_guest_num || (cnt->_status == LTKCON_COUNTED_OPEN)) {
+			cnt->_status = LTKCON_COUNTED_CLOSED;
+		}
+		else {
+			cnt->_status = LTKCON_SOCKET_CLOSED;
+		}
+	}
+}
+
+/*	Reopen the TCP server
+	This is automatically called for an LTKCON_COUNTED_CLOSED container if a client is leaving.
+	Calling it manually makes the container LTKCON_COUNTED_OPEN if a pointer to an int is given as argument
+	(the pointed integer defines number of empty slot to add to existing connection).
+	Calling it manually makes the container LTKCON_SOCKET_OPEN if 0 is given as argument,
+	then, the container won't close automatically.
+*/
+void LTKCntUnLock(LTKobj *obj, va_list arg) {
+	LTKcontainer *cnt = (LTKcontainer *) obj;
+	int *num = va_arg(arg, int *);
+
+	if(cnt->_dev._fd < 0) {
+		switch(cnt->_status) {
+		case LTKCON_REGULAR:
+		case LTKCON_SOCKET_OPEN:
+		case LTKCON_COUNTED_OPEN:
+			return;
+
+		default:
+			{
+				struct sockaddr_in *addr = (struct sockaddr_in *) &cnt->_conf;
+
+				addr->sin_family = AF_INET;
+				addr->sin_addr.s_addr = INADDR_ANY;
+				addr->sin_port = cnt->_port;
+			}
+
+			if((cnt->_dev._fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+				LTKrint(0, "LTKCntUnLock : Socket creation failed : %s", strerror(errno));
+				return;
+			}
+
+			{
+				int arg = 1;
+				if(setsockopt(cnt->_dev._fd, SOL_SOCKET, SO_REUSEADDR, &arg, sizeof(int)) < 0) {
+					LTKrint(0, "LTKCntUnLock : Set socket address reusable failed : %s", strerror(errno));
+					close(cnt->_dev._fd);
+					return;
+				}
+			}
+
+			if(bind(cnt->_dev._fd, &cnt->_conf, cnt->_len)) {
+				LTKrint(0, "LTKCntUnLock : Socket binding failed : %s", strerror(errno));
+				close(cnt->_dev._fd);
+				return;
+			}
+
+			if(LTKTrg(&cnt->_dev._obj, cnt->_dev._fd, EPOLLIN | EPOLLHUP)) {
+				LTKrint(0, "LTKCntUnLock : Socket event subscription failed");
+				close(cnt->_dev._fd);
+				return;
+			}
+
+			if(listen(cnt->_dev._fd, 4)) {
+				LTKrint(0, "LTKCntUnLock : Socket listening failed : %s", strerror(errno));
+				LTKTrg(0, cnt->_dev._fd, 0);
+				close(cnt->_dev._fd);
+				return;
+			}
+
+			if(num && num[0]) {
+				cnt->_guest_num = num[0];
+				cnt->_status = LTKCON_COUNTED_OPEN;
+			}
+			else {
+				cnt->_guest_num = 0;
+				cnt->_status = LTKCON_SOCKET_OPEN;
+			}
+
+			return;
+		}
+	}
+}
+
+void LTKCntHdl(LTKobj **obj) {
+	LTKcontainer *mtr = (LTKcontainer *) obj[0];
+	LTKendpoint *ret;
+	int peer_fd;
+	struct sockaddr peer_conf;
+	socklen_t peer_len;
+
+	if(!obj[0]->_buf) {
+		while(mtr->_slv) {
+			LTKFre(&mtr->_slv->_obj);
+		}
+
+		if(mtr->_dev._fd >= 0) {
+			LTKTrg(0, mtr->_dev._fd, 0);
+			shutdown(mtr->_dev._fd, SHUT_RDWR); /* Avoid time wait */
+			close(mtr->_dev._fd);
+		}
+
+		LTKFre(obj[0]);
+		return;
+	}
+
+	if(mtr->_type = LTKCON_REGULAR) {
+		/* TODO Later, see man inotify */
+	}
+	else {
+		peer_fd = accept(mtr->_dev._fd, &peer_conf, &peer_len);
+
+		if(peer_fd < 0) {
+			LTKrint(0, "LTKCntHdl : Connection acceptation failed : %s", strerror(errno));
+			return;
+		}
+
+		if(peer_conf.sa_family != AF_INET) {
+			LTKrint(0, "LTKCntHdl : Connection between INET and not INET endpoints refused");
+			shutdown(peer_fd, SHUT_RDWR); /* Avoid time wait */
+			close(peer_fd);
+			return;
+		}
+
+		if(LTKTrg(&ret->_obj, peer_fd, EPOLLIN | EPOLLHUP)) {
+			LTKrint(0, "LTKCntHdl : Socket event subscription failed");
+			shutdown(peer_fd, SHUT_RDWR); /* Avoid time wait */
+			close(peer_fd);
+			return;
+		}
+
+		switch(mtr->_status) {
+		case LTKCON_COUNTED_OPEN:
+			if(mtr->_guest_num) mtr->_guest_num--;
+			if(mtr->_guest_num) break;
+			LTKRun(obj[0], LTKCON_LOCK);
+			LTKrint(1, "LTKCntHdl : Max client connection reached, closing socket");
+		case LTKCON_REGULAR:
+		case LTKCON_SOCKET_CLOSED:
+		case LTKCON_COUNTED_CLOSED:
+			return;
+		}
+
+		if(!(ret = (LTKendpoint *) LTKAdd(LTKNdpCtr()))) {
+			LTKrint(0, "LTKCntHdl : Unable to create the client instance");
+			shutdown(peer_fd, SHUT_RDWR); /* Avoid time wait */
+			close(peer_fd);
+			return;
+		}
+
+		ret->_dev._fd = peer_fd;
+		sprintf(ret->_dev._path, "%s:%d",
+			inet_ntoa(((struct sockaddr_in *) &peer_conf)->sin_addr),
+			ntohs(mtr->_port));
+		ret->_port = mtr->_port;
+		ret->_status = LTKNDP_SOCKET;
+
+		memcpy(&ret->_conf, &peer_conf, sizeof(struct sockaddr));
+		memcpy(&ret->_len, &peer_len, sizeof(socklen_t));
+	}
+
+	ret->_mtr = mtr;
+	ret->_nxt = mtr->_slv;
+	ret->_prv = ret->_prv ? ret->_prv->_prv : 0;
+	if(ret->_nxt) ret->_nxt->_prv = ret;
+	if(ret->_prv) ret->_prv->_nxt = ret;
+	mtr->_slv = ret;
+	while(mtr->_slv->_prv) mtr->_slv = mtr->_slv->_prv;
+}
+
+LTKctr *LTKCtrCnt() {
+	static LTKctr *ret = 0;
+
+	if(ret) return ret;
+	ret = LTKCtr(LTKCtrdev(), 16, sizeof(LTKcontainer), LTKCntHdl);
+
+	ret->_fct[LTKDEVLOCK] = LTKCntLock;
+	ret->_fct[LTKDEVUNLOCK] = LTKCntUnLock;
+
+	return ret;
+}
+
+/*	Create a folder handler
+	for path specified by ptprt arg if type == LTKCON_REGULAR or
+	a listening socket for TCP connections if type == LTKCON_SOCKET
+	which will listen on port specified by addr arg
+	Events arg is optionnal and can be set to 0.
+	This arg let the user specify what event to subscribe to
+	for the specified file or folder,
+	it is ignored if type == LTKCON_SOCKET.
+*/
+LTKcontainer *LTKCnt(uint8_t type, char *ptprt, uint32_t events) {
+	LTKcontainer *ret;
+	int fd = -1;
+	char *porterror = ptprt;
+	uint16_t port = 0;
+
+	switch(type) {
+	case LTKCON_REGULAR:
+		{
+			struct stat buf;
+
+			if(stat(ptprt, &buf)) {
+				switch(errno) {
+				default:
+					LTKrint(1, "LTKCnt : Unable to get %s proprieties : %s", ptprt, strerror(errno));
+					return 0;
+
+				case EBADF:
+				case ENOENT:
+					if(mkdir(ptprt, 0644)) {
+						LTKrint(0, "LTKCnt : Unable to create %s : %s", ptprt, strerror(errno));
+						return 0;
+					}
+				}
+
+			}
+			else if(!S_ISDIR(buf.st_mode)) {
+				LTKrint(0, "LTKCnt : %s is not a directory", ptprt);
+				return 0;
+			}
+
+			/*	Here, it looks strange, but it is not.
+				we use direntry to read content of directory.
+				But we use inotify to be notified of any event
+				on that directory.
+				We could use inotify with only on fd, storing it in LTKroot
+				and watching everything we need from that fd.
+				But we would then loose epoll benefit because
+				we can't store library data in inotify events.
+			*/
+			if(events) {
+				if((fd = inotify_init()) < 0) {
+					LTKrint(0, "LTKCnt : Unable to create notifier : %s", strerror(errno));
+					return 0;
+				}
+
+				if((fd = inotify_add_watch(fd, ptprt, events)) < 0) {
+					LTKrint(0, "LTKCnt : Unable to add %s to notifier : %s", ptprt, strerror(errno));
+					return 0;
+				}
+			}
+		}
+		break;
+
+	case LTKCON_SOCKET:
+		port = strtol(ptprt, porterror, 0);
+		
+		if(ptprt == porterror) {
+			LTKrint(0, "LTKCnt : %s is not a valid port", ptprt);
+			return 0;
+		}
+		break;
+
+	default:
+		LTKrint(0, "LTKCnt : The specified type of container is not valid");
+		return 0;
+	}
+
+	LTKcontainer *ret = (LTKcontainer *) LTKAdd(LTKCtrCnt());
+
+	if(type == LTKCON_REGULAR) {
+		if(!(ret->_dev._path = strdup(ptprt))) {
+			LTKFre(&ret->_dev.obj);
+			return 0;
+		}
+	}
+	else {
+		ret->_port = port;
+	}
+
+	ret->_status = type;
+	ret->_dev._fd = fd;
+	return ret;
+}
+
+/*	Handle socket interruptions :
+	Destroys itself if hang up (connection closed by host)
+	Returns what handler object is defined to return
+	Returns itself if handler object returns nothing or no handler object defined
+*/
+void LTKHdlNdp(LTKobj **obj) {
+	uint8_t ret = 0;
+	LTKendpoint *ndp = (LTKendpoint *) obj[0];
+
+	if(
+	if(!recv(clt->_dev._fd, &ret, 1, MSG_PEEK)) {
+		/* Connection closed, notify it in the status */
+		clt->_status = 0;
+	}
+
+	if(clt->_hdl) {
+		/* If !clt->_status, clt->_hdl->_ctr._hdl() must make sure
+		nothing will reference this socket anymore
+		because socket is being destroyed /!\ */
+		ret = clt->_hdl->_ctr._hdl(clt->_hdl, who);
+	}
+
+	if(!clt->_status) {
+		/* Connection closed, be sure that if parent is a server, freeing a place */
+		if(obj->_mtr->_ctr == LTKCtrSrv()) {
+			LTKRun(obj->_mtr, LTKDEVUNLOCK);
+		}
+		/* shutdown(clt->_dev._fd, SHUT_RDWR); /* Avoid time wait */
+		LTKDEL(obj);
+		return 1;
+	}
+
+	return ret;
+}
+
+/*	Add a client socket :
+	type is either SOCK_STREAM for a TCP connection
+	or SOCK_DGRAM for an UDP connection
+	addr must be a string in the form CCC.CCC.CCC.CCC:PPPPP
+	where CCC must be a value between 0 and 255 included
+	and PPPPP must be a value between 0 and 65535 included
+	It represent the adresse and the port of the host to connect with
+*/
+LTKobj *LTKAddClt(int type, const char *addr) {
+	LTKclt *ret = (LTKclt *) LTKAdd(LTKCtrClt());
+	struct sockaddr_in servaddr;
+
+	ret->_type = type;
+	ret->_dev._fd = -1;
+	ret->_status = 1;
+	
+	if(addr) {
+		uint8_t *portstart = strchr(addr, ':');
+		uint8_t *portend;
+		uint16_t port;
+		
+		if(!portstart[0]) {
+			LTKDEL((LTKobj *) ret);
+			return 0;
+		}
+		*(portstart++) = 0;
+		port = strtol(portstart, portend, 0);
+		
+		if(portstart == portend) {
+			LTKDEL((LTKobj *) ret);
+			return 0;
+		}
+		
+		if((ret->_dev._fd = socket(AF_INET, ret->_type, 0)) < 0) {
+			LTKDEL((LTKobj *) ret);
+			return 0;
+		}
+		
+		ret->_conf.sin_family = AF_INET;
+		if(!inet_aton(addr, &ret->_conf.sin_addr.s_addr) {
+			LTKDEL((LTKobj *) ret);
+			return 0;
+		}
+		ret->_conf.sin_port = htons(port);
+		
+		if(connect(sockfd,(struct sockaddr *) &servaddr,sizeof(sockaddr_in)) < 0) {
+			LTKDEL((LTKobj *) ret);
+			return 0;
+		}
+	}
+	
+	return ret;
+}
+
+uint8_t LTKHdlSrv(LTKobj *obj, LTKobj **who) {
+	LTKsrv *srv = (LTKsrv *) obj;
+	LTKclt *clt = LTKAddClt(obj, srv->_type, 0);
+
+	if((clt->_dev._fd = accept(srv->_dev._fd,
+							(struct sockaddr *) srv->_conf,
+							sizeof(struct sockaddr))) < 0) {
+		LTKDEL((LTKobj *) clt);
+		
+		*who = obj;
+		
+		return 0;
+	}
+	
+	*who = clt;
+	
+	LTKRun(obj, LTKDEVLOCK);
+	
+	clt->_port = srv->_port;
+}
+
+LTKsrv *LTKAddSrv(uint8_t type, int port) {
+	LTKobj *obj = LTKAdd(LTKCtrSrv());
+	LTKRun(obj, LTKDEVUNLOCK);
+	
+	return obj;
+}
+
+int main(int argc, char *argv[]) {
+	
+	LTKFREEALL;
+	return 0;
+}
